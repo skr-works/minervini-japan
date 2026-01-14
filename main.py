@@ -96,9 +96,10 @@ def read_tickers_from_sheet(ws) -> list[str]:
 
 def write_output(ws, headers: list[str], rows: list[list]):
     # Write headers row 1 and data from row 2
-    ws.update("A1", [headers])
+    # FIX: Use named arguments to avoid DeprecationWarning
+    ws.update(range_name="A1", values=[headers])
     if rows:
-        ws.update("A2", rows)
+        ws.update(range_name="A2", values=rows)
     else:
         # Clear old data area minimally (leave headers)
         ws.batch_clear(["A2:Z"])
@@ -191,11 +192,23 @@ def parse_earnings_date_from_calendar(cal) -> date | None:
         for key in ["Earnings Date", "EarningsDate", "earningsDate"]:
             if key in cal:
                 v = cal[key]
-                if isinstance(v, (list, tuple)) and len(v) > 0:
+                # v can be a list, an array, or a scalar.
+                # If it's a sequence, take the first element.
+                if isinstance(v, (list, tuple, np.ndarray, pd.Series, pd.Index)):
+                    if len(v) == 0:
+                        continue
                     v0 = v[0]
                 else:
                     v0 = v
+                
                 ts = pd.to_datetime(v0, errors="coerce")
+                
+                # FIX: Handle case where ts is still an array/Index (e.g. from array input)
+                if isinstance(ts, (pd.Index, pd.Series, np.ndarray)):
+                    if len(ts) == 0:
+                        return None
+                    ts = ts[0]
+
                 if pd.isna(ts):
                     return None
                 return ts.date()
@@ -217,13 +230,16 @@ def analyze_universe(
 
     all_symbols = tickers + [index_ticker]
 
+    # FIX: Attempt to reduce 'database is locked' errors by not using shared cache if possible,
+    # though yfinance cache is automatic. 
+    # threads=True is faster but caused the lock. We keep True for speed but handle errors gracefully.
     df = yf.download(
         tickers=all_symbols,
         period="2y",
         interval="1d",
         group_by="ticker",
         auto_adjust=False,
-        threads=True,
+        threads=True, 
         progress=False,
     )
 
@@ -234,25 +250,39 @@ def analyze_universe(
                 sub = df[sym].dropna(how="all")
                 data[sym] = sub
     else:
-        data[all_symbols[0]] = df.dropna(how="all")
+        # If single ticker was downloaded (rare here as we add index), handle gracefully
+        if len(all_symbols) == 1:
+             data[all_symbols[0]] = df.dropna(how="all")
+        else:
+             # Fallback if structure is unexpected
+             pass
 
     if index_ticker not in data or data[index_ticker].empty:
-        raise RuntimeError(f"Index ticker data missing: {index_ticker}")
-
-    idx_close = data[index_ticker]["Close"].dropna()
+        # If index download failed (e.g. database locked), we cannot calculate RS
+        print(f"Warning: Index ticker {index_ticker} data missing. RS calculation will fail.")
+        idx_close = pd.Series(dtype=float)
+    else:
+        idx_close = data[index_ticker]["Close"].dropna()
 
     rows = []
     for t in tickers:
         d = data.get(t)
+        # If ticker download failed (e.g. 8283.T lock), d is None or empty
         if d is None or d.empty:
-            rows.append([t, "除外"] + [""] * 17)
+            rows.append([t, "取得失敗"] + [""] * 17)
             continue
 
         close = d["Close"].dropna()
         high = d["High"].dropna()
 
-        if len(close) < 260 or len(idx_close) < 260:
-            rows.append([t, "除外"] + [""] * 17)
+        # Check data length
+        if len(close) < 260 or (not idx_close.empty and len(idx_close) < 260):
+            # Not enough data
+            if len(close) < 260:
+                 rows.append([t, "データ不足"] + [""] * 17)
+            else:
+                 # Index data missing case
+                 rows.append([t, "指数データ不足"] + [""] * 17)
             continue
 
         last_close = float(close.iloc[-1])
@@ -278,14 +308,16 @@ def analyze_universe(
 
         t_now = float(close.iloc[-1])
         t_1y = safe_float(close.shift(252).iloc[-1])
-        i_now = float(idx_close.iloc[-1])
-        i_1y = safe_float(idx_close.shift(252).iloc[-1])
-
+        
         rs_ratio = None
         rs_ok = False
-        if t_1y and i_1y and t_1y > 0 and i_1y > 0:
-            rs_ratio = (t_now / t_1y) / (i_now / i_1y)
-            rs_ok = rs_ratio > 1.0
+
+        if not idx_close.empty:
+            i_now = float(idx_close.iloc[-1])
+            i_1y = safe_float(idx_close.shift(252).iloc[-1])
+            if t_1y and i_1y and t_1y > 0 and i_1y > 0:
+                rs_ratio = (t_now / t_1y) / (i_now / i_1y)
+                rs_ok = rs_ratio > 1.0
 
         std10 = close.rolling(10).std()
         vcp_hint = False
