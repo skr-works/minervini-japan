@@ -2,11 +2,11 @@ name: sepa-jp-daily
 
 on:
   schedule:
-    - cron: "45 6 * * 1-5"  # JST 15:45 (UTC 06:45)
+    - cron: "34 6 * * 1-5"  # JST 15:34 (UTC 06:34)
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   run:
@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -32,3 +34,23 @@ jobs:
           APP_CONFIG_JSON: ${{ secrets.APP_CONFIG_JSON }}
         run: |
           python main.py
+
+      - name: Keepalive (Avoid 60-day suspension)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 最終コミットからの経過日数を計算
+          last_commit_ts=$(git log -1 --format=%ct)
+          current_ts=$(date +%s)
+          days_diff=$(( (current_ts - last_commit_ts) / 86400 ))
+          
+          echo "Days since last commit: $days_diff"
+          
+          if [ "$days_diff" -gt 50 ]; then
+            echo "Pushing empty commit to keep workflow active..."
+            git commit --allow-empty -m "keepalive: avoid 60-day suspension"
+            git push
+          else
+            echo "No keepalive needed."
+          fi
