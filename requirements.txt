@@ -1,4 +1,4 @@
-yfinance==0.2.43
+yfinance
 pandas==2.2.2
 numpy==2.0.1
 
