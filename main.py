@@ -61,7 +61,10 @@ def open_worksheet(cfg: dict):
     gc = gspread.authorize(creds)
     sh = gc.open_by_url(cfg["sheet_url"])
 
-    ws_name = cfg.get("worksheet_name", "Config")
+    ws_name = (cfg.get("worksheet_name") or "").strip()
+    if not ws_name:
+        raise RuntimeError("worksheet_name is required in APP_CONFIG_JSON (do not hardcode in main.py).")
+
     ws = sh.worksheet(ws_name)
     return ws
 
@@ -113,7 +116,6 @@ def safe_float(x):
             if math.isnan(v) or math.isinf(v):
                 return None
             return v
-        # pandas scalar
         v = float(x)
         if math.isnan(v) or math.isinf(v):
             return None
@@ -128,16 +130,11 @@ def slope_positive(series: pd.Series, lookback: int = 20) -> bool:
         return False
     y = s.iloc[-lookback:].values
     x = np.arange(len(y))
-    # simple linear regression slope
     a = np.polyfit(x, y, 1)[0]
     return a > 0
 
 
 def compute_cagr_from_series(values: list[float]) -> float | None:
-    """
-    values: annual points in chronological order (old -> new)
-    Return CAGR as decimal (e.g. 0.154) or None.
-    """
     vals = [safe_float(v) for v in values]
     if any(v is None for v in vals):
         return None
@@ -146,17 +143,12 @@ def compute_cagr_from_series(values: list[float]) -> float | None:
     old = vals[0]
     new = vals[-1]
     years = len(vals) - 1
-    # Avoid negative / zero (CAGR meaningless here)
     if old is None or new is None or old <= 0 or new <= 0:
         return None
     return (new / old) ** (1 / years) - 1
 
 
 def pick_row(financials: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
-    """
-    financials: rows = line items, cols = periods (recent -> old)
-    returns Series of values by col (recent -> old) or None
-    """
     if financials is None or financials.empty:
         return None
     for k in candidates:
@@ -171,9 +163,7 @@ def annual_points_last_4(series_recent_to_old: pd.Series) -> list[float] | None:
     s = series_recent_to_old.dropna()
     if len(s) < 2:
         return None
-    # yfinance financials often: columns are recent first
-    s = s.iloc[:4]  # take up to 4 annual points
-    # reverse to old -> new
+    s = s.iloc[:4]
     vals = list(reversed(s.values.tolist()))
     return vals
 
@@ -195,18 +185,12 @@ def format_date(d: date | None) -> str:
 
 
 def parse_earnings_date_from_calendar(cal) -> date | None:
-    """
-    yfinance ticker.calendar can be dict-like.
-    Earnings Date may be list/tuple of Timestamp(s).
-    """
     if cal is None:
         return None
     try:
-        # common keys on yfinance
         for key in ["Earnings Date", "EarningsDate", "earningsDate"]:
             if key in cal:
                 v = cal[key]
-                # Often: [Timestamp('2026-02-10 00:00:00'), Timestamp('2026-02-14 00:00:00')]
                 if isinstance(v, (list, tuple)) and len(v) > 0:
                     v0 = v[0]
                 else:
@@ -231,10 +215,8 @@ def analyze_universe(
     if not tickers:
         return []
 
-    # Include index in one-shot download
     all_symbols = tickers + [index_ticker]
 
-    # Download 2 years daily OHLCV
     df = yf.download(
         tickers=all_symbols,
         period="2y",
@@ -245,10 +227,6 @@ def analyze_universe(
         progress=False,
     )
 
-    # yfinance returns:
-    # - MultiIndex columns when multiple tickers
-    # - Single ticker: normal columns
-    # Normalize to dict of per-ticker DataFrame
     data = {}
     if isinstance(df.columns, pd.MultiIndex):
         for sym in all_symbols:
@@ -256,7 +234,6 @@ def analyze_universe(
                 sub = df[sym].dropna(how="all")
                 data[sym] = sub
     else:
-        # only one symbol scenario (unlikely here)
         data[all_symbols[0]] = df.dropna(how="all")
 
     if index_ticker not in data or data[index_ticker].empty:
@@ -284,7 +261,6 @@ def analyze_universe(
         ma150 = close.rolling(150).mean()
         ma200 = close.rolling(200).mean()
 
-        # Trend: price > 75 > 150 > 200 and 75 slope positive
         trend_ok = (
             (safe_float(ma75.iloc[-1]) is not None)
             and (safe_float(ma150.iloc[-1]) is not None)
@@ -293,7 +269,6 @@ def analyze_universe(
             and slope_positive(ma75, lookback=20)
         )
 
-        # 52w high/low filters (252 trading days)
         close_252 = close.iloc[-252:]
         low_52w = float(close_252.min())
         high_52w = float(close_252.max())
@@ -301,7 +276,6 @@ def analyze_universe(
 
         trend_pass = trend_ok and hl_ok
 
-        # RS ratio vs index (52w)
         t_now = float(close.iloc[-1])
         t_1y = safe_float(close.shift(252).iloc[-1])
         i_now = float(idx_close.iloc[-1])
@@ -313,7 +287,6 @@ def analyze_universe(
             rs_ratio = (t_now / t_1y) / (i_now / i_1y)
             rs_ok = rs_ratio > 1.0
 
-        # VCP hint: std(close,10) < mean(rolling std(close,10) over last 60)
         std10 = close.rolling(10).std()
         vcp_hint = False
         if std10.notna().sum() >= 70:
@@ -322,7 +295,6 @@ def analyze_universe(
             if recent_std10 is not None and mean_std10_60 is not None:
                 vcp_hint = recent_std10 < mean_std10_60
 
-        # Vol high: std(returns,20) > mean(rolling std(returns,20) over last 60)
         rets = close.pct_change()
         vol20 = rets.rolling(20).std()
         vol_high = False
@@ -332,13 +304,11 @@ def analyze_universe(
             if recent_vol20 is not None and mean_vol20_60 is not None:
                 vol_high = recent_vol20 > mean_vol20_60
 
-        # Buy timing: close >= 0.95 * (20d high)
-        hi20 = safe_float(high.iloc[-20:].max()) if len(high) >= 20 else None
         buy_timing = ""
+        hi20 = safe_float(high.iloc[-20:].max()) if len(high) >= 20 else None
         if hi20 is not None and last_close >= hi20 * 0.95:
             buy_timing = f"{hi20:.0f}超えで買い"
 
-        # Fundamentals via yfinance Ticker (per-symbol)
         op_cagr = None
         ord_cagr = None
         eps_cagr = None
@@ -353,7 +323,6 @@ def analyze_universe(
         try:
             tk = yf.Ticker(t)
 
-            # earnings date
             try:
                 cal = tk.calendar
                 earnings_date = parse_earnings_date_from_calendar(cal)
@@ -365,32 +334,27 @@ def analyze_universe(
                 if 0 <= days <= 30:
                     alert = "⚠️1ヶ月以内"
 
-            # financials (annual)
             fin = None
             try:
                 fin = tk.financials
             except Exception:
                 fin = None
 
-            # Operating profit candidates
             op_row = pick_row(fin, ["Operating Income"])
             op_vals = annual_points_last_4(op_row) if op_row is not None else None
             if op_vals and len(op_vals) >= 2:
                 op_cagr = compute_cagr_from_series(op_vals)
 
-            # Ordinary profit (no perfect mapping in Yahoo): use Pretax Income / Income Before Tax as proxy if present
             ord_row = pick_row(fin, ["Pretax Income", "Income Before Tax"])
             ord_vals = annual_points_last_4(ord_row) if ord_row is not None else None
             if ord_vals and len(ord_vals) >= 2:
                 ord_cagr = compute_cagr_from_series(ord_vals)
 
-            # EPS series if present
             eps_row = pick_row(fin, ["Basic EPS", "Diluted EPS"])
             eps_vals = annual_points_last_4(eps_row) if eps_row is not None else None
             if eps_vals and len(eps_vals) >= 2:
                 eps_cagr = compute_cagr_from_series(eps_vals)
 
-            # info for EPS / fair value / uprev
             info = {}
             try:
                 info = tk.info or {}
@@ -414,10 +378,8 @@ def analyze_universe(
                 divergence = fair_value / last_close - 1
 
         except Exception:
-            # keep blanks on failures
             pass
 
-        # Final judgement
         if trend_pass and rs_ok:
             verdict = "合格"
         elif trend_pass or rs_ok:
@@ -427,30 +389,29 @@ def analyze_universe(
 
         allocation = "Half" if (alert or vol_high) else "Full"
 
-        # Target sell (keep simple per original spec example): +14%
         target_sell = last_close * 1.14
 
         rows.append(
             [
-                t.replace(".T", ""),                 # A 銘柄コード（表示は素コード）
-                verdict,                              # B
-                round(last_close, 2),                 # C
-                "○" if (last_close > float(ma75.iloc[-1]) and slope_positive(ma75, 20)) else "×",  # D
-                f"{float(ma200.iloc[-1]):.0f} (上向き)" if slope_positive(ma200, 20) else f"{float(ma200.iloc[-1]):.0f} (横/下)",  # E
-                round(rs_ratio, 3) if rs_ratio is not None else "",   # F RS比
-                format_bool_mark(vcp_hint),           # G VCP示唆
-                format_pct(op_cagr),                  # H
-                format_pct(ord_cagr),                 # I
-                format_pct(eps_cagr),                 # J
-                uprev,                                # K
-                format_date(earnings_date),           # L
-                alert,                                # M
-                format_bool_mark(vol_high),           # N
-                buy_timing,                           # O
-                round(fair_value, 2) if fair_value is not None else "",  # P
-                format_pct(divergence) if divergence is not None else "", # Q
-                allocation,                           # R
-                round(target_sell, 2),                # S
+                t.replace(".T", ""),
+                verdict,
+                round(last_close, 2),
+                "○" if (last_close > float(ma75.iloc[-1]) and slope_positive(ma75, 20)) else "×",
+                f"{float(ma200.iloc[-1]):.0f} (上向き)" if slope_positive(ma200, 20) else f"{float(ma200.iloc[-1]):.0f} (横/下)",
+                round(rs_ratio, 3) if rs_ratio is not None else "",
+                format_bool_mark(vcp_hint),
+                format_pct(op_cagr),
+                format_pct(ord_cagr),
+                format_pct(eps_cagr),
+                uprev,
+                format_date(earnings_date),
+                alert,
+                format_bool_mark(vol_high),
+                buy_timing,
+                round(fair_value, 2) if fair_value is not None else "",
+                format_pct(divergence) if divergence is not None else "",
+                allocation,
+                round(target_sell, 2),
             ]
         )
 
