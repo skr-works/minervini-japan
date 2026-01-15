@@ -9,6 +9,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -286,26 +287,291 @@ def parse_earnings_date_from_calendar(cal) -> date | None:
 
 
 # ----------------------------
-# Core analysis
+# Core analysis (Parallelized)
 # ----------------------------
+
+def process_single_ticker(t, d, idx_close):
+    """
+    1銘柄分の分析を実行する関数（並列処理用）
+    """
+    # 取得失敗チェック
+    if d is None or d.empty:
+        return [t, "", "", "取得失敗"] + [""] * 19
+
+    close = d["Close"].dropna()
+    high = d["High"].dropna()
+
+    # データ不足チェック
+    if len(close) < 260 or (not idx_close.empty and len(idx_close) < 260):
+        if len(close) < 260:
+            return [t, "", "", "データ不足"] + [""] * 19
+        else:
+            return [t, "", "", "指数データ不足"] + [""] * 19
+
+    last_close = float(close.iloc[-1])
+
+    ma75 = close.rolling(75).mean()
+    ma150 = close.rolling(150).mean()
+    ma200 = close.rolling(200).mean()
+
+    trend_ok = (
+        (safe_float(ma75.iloc[-1]) is not None)
+        and (safe_float(ma150.iloc[-1]) is not None)
+        and (safe_float(ma200.iloc[-1]) is not None)
+        and (last_close > float(ma75.iloc[-1]) > float(ma150.iloc[-1]) > float(ma200.iloc[-1]))
+        and slope_positive(ma75, lookback=20)
+    )
+
+    close_252 = close.iloc[-252:]
+    low_52w = float(close_252.min())
+    high_52w = float(close_252.max())
+    hl_ok = (last_close > low_52w * 1.30) and (last_close > high_52w * 0.75)
+
+    trend_pass = trend_ok and hl_ok
+
+    t_now = float(close.iloc[-1])
+    t_1y = safe_float(close.shift(252).iloc[-1])
+    
+    rs_ratio = None
+    rs_ok = False
+
+    if not idx_close.empty:
+        i_now = float(idx_close.iloc[-1])
+        i_1y = safe_float(idx_close.shift(252).iloc[-1])
+        if t_1y and i_1y and t_1y > 0 and i_1y > 0:
+            rs_ratio = (t_now / t_1y) / (i_now / i_1y)
+            rs_ok = rs_ratio > 1.0
+
+    std10 = close.rolling(10).std()
+    vcp_hint = False
+    if std10.notna().sum() >= 70:
+        recent_std10 = safe_float(std10.iloc[-1])
+        mean_std10_60 = safe_float(std10.iloc[-60:].mean())
+        if recent_std10 is not None and mean_std10_60 is not None:
+            vcp_hint = recent_std10 < mean_std10_60
+
+    rets = close.pct_change()
+    vol20 = rets.rolling(20).std()
+    vol_high = False
+    if vol20.notna().sum() >= 90:
+        recent_vol20 = safe_float(vol20.iloc[-1])
+        mean_vol20_60 = safe_float(vol20.iloc[-60:].mean())
+        if recent_vol20 is not None and mean_vol20_60 is not None:
+            vol_high = recent_vol20 > mean_vol20_60
+
+    buy_timing_price = None
+    hi20 = safe_float(high.iloc[-20:].max()) if len(high) >= 20 else None
+    if hi20 is not None and last_close >= hi20 * 0.95:
+        buy_timing_price = hi20
+
+    # --- buhin.py logic integration starts here ---
+    
+    # Initialize placeholders
+    stock_name = ""
+    industry = "-"
+    fair_value = None
+    divergence = None
+    op_cagr_val = None
+    ord_cagr_val = None
+    eps_cagr_val = None
+    uprev = ""
+    earnings_date = None
+    alert = ""
+
+    try:
+        # 1. Scraping Name/Sector (buhin.py style)
+        stock_name, industry = get_japanese_name_and_sector(t)
+
+        tk = yf.Ticker(t)
+        
+        # 2. Calendar / Alert
+        try:
+            cal = tk.calendar
+            earnings_date = parse_earnings_date_from_calendar(cal)
+        except Exception:
+            earnings_date = None
+
+        if earnings_date is not None:
+            days = (earnings_date - get_today_jst()).days
+            if 0 <= days <= 30:
+                alert = "⚠️1ヶ月以内"
+        
+        # 3. Financials (buhin.py robust logic)
+        financials = tk.financials
+        balance_sheet = tk.balance_sheet
+        info = tk.info or {}
+        
+        # Basic info extraction (fallback for name)
+        if stock_name == t or stock_name == "":
+            stock_name = info.get('longName', t)
+
+        # If no financials, skip calculation but keep row
+        if not financials.empty and not balance_sheet.empty:
+            latest_date_bs = balance_sheet.columns[0]
+            latest_date_pl = financials.columns[0]
+            
+            # --- ROIC Logic ---
+            op_income = get_value(financials, ['Operating Income', 'Operating Profit'], latest_date_pl)
+            nopat = op_income * 0.7
+            
+            interest_bearing_debt = get_value(balance_sheet, ['Total Debt'], latest_date_bs)
+            if interest_bearing_debt == 0:
+                short_debt = get_value(balance_sheet, ['Current Debt', 'Short Long Term Debt'], latest_date_bs)
+                long_debt = get_value(balance_sheet, ['Long Term Debt'], latest_date_bs)
+                interest_bearing_debt = short_debt + long_debt
+            
+            equity = get_value(balance_sheet, ['Total Stockholder Equity', 'Total Equity', 'Stockholders Equity'], latest_date_bs)
+            forex_adj = get_value(balance_sheet, ['Foreign Currency Translation Adjustments', 'Accumulated Other Comprehensive Income'], latest_date_bs)
+            adjusted_equity = equity - forex_adj
+            if adjusted_equity <= 0: adjusted_equity = equity
+            
+            invested_capital = interest_bearing_debt + adjusted_equity
+            roic = (nopat / invested_capital * 100) if invested_capital > 0 else 0
+
+            # --- CAGR Logic ---
+            growth_dates = financials.columns[:4]
+            final_cagr = 0
+            
+            # Helper for EPS history for display
+            eps_row = pick_row(financials, ["Basic EPS", "Diluted EPS"])
+            eps_vals_display = annual_points_last_4(eps_row) if eps_row is not None else None
+            if eps_vals_display and len(eps_vals_display) >= 2:
+                eps_cagr_val = compute_cagr_from_series(eps_vals_display)
+
+            # Helper for OP/Ord history for display
+            op_row_disp = pick_row(financials, ["Operating Income"])
+            op_vals_disp = annual_points_last_4(op_row_disp) if op_row_disp is not None else None
+            if op_vals_disp and len(op_vals_disp) >= 2:
+                op_cagr_val = compute_cagr_from_series(op_vals_disp)
+
+            ord_row = pick_row(financials, ["Pretax Income", "Income Before Tax"])
+            ord_vals = annual_points_last_4(ord_row) if ord_row is not None else None
+            if ord_vals and len(ord_vals) >= 2:
+                ord_cagr_val = compute_cagr_from_series(ord_vals)
+
+            # CAGR calculation for Valuation (buhin.py logic)
+            if len(growth_dates) >= 2:
+                latest_d = growth_dates[0]
+                oldest_d = growth_dates[-1]
+                years_span = len(growth_dates) - 1
+                
+                def get_eps_val(d):
+                    val = get_value(financials, ['Basic EPS'], d)
+                    if val != 0: return val
+                    ni = get_value(financials, ['Net Income', 'Net Income Common Stockholders'], d)
+                    shares = get_value(financials, ['Basic Average Shares'], d)
+                    return ni / shares if (ni != 0 and shares > 0) else 0
+
+                eps_latest = get_eps_val(latest_d)
+                eps_oldest = get_eps_val(oldest_d)
+                
+                cagr_eps_internal = 0
+                if eps_oldest > 0 and eps_latest > 0:
+                    cagr_eps_internal = ((eps_latest / eps_oldest)**(1 / years_span) - 1) * 100
+                
+                op_latest = get_value(financials, ['Operating Income'], latest_d)
+                op_oldest = get_value(financials, ['Operating Income'], oldest_d)
+                cagr_op_internal = 0
+                if op_oldest > 0 and op_latest > 0:
+                    cagr_op_internal = ((op_latest / op_oldest)**(1 / years_span) - 1) * 100
+                
+                if cagr_eps_internal != 0 and cagr_op_internal != 0:
+                    final_cagr = min(cagr_eps_internal, cagr_op_internal)
+                elif cagr_eps_internal != 0:
+                    final_cagr = cagr_eps_internal
+                elif cagr_op_internal != 0:
+                    final_cagr = cagr_op_internal
+
+            # --- Target Price Logic ---
+            # Base PER selection
+            calc_target_per = 15
+            if final_cagr > 20: calc_target_per = 25
+            elif final_cagr > 10: calc_target_per = 20
+            elif final_cagr < 0: calc_target_per = 10
+            
+            # ROIC adjustment
+            if roic > 15: calc_target_per *= 1.15
+            elif roic >= 10: calc_target_per *= 1.05
+            elif roic < 5: calc_target_per *= 0.9
+            
+            # Cap
+            if calc_target_per > 25: calc_target_per = 25
+            
+            per_info = info.get('trailingPE', 0)
+            # Use current price from yf.download (last_close) for consistency
+            current_eps = last_close / per_info if (per_info and per_info > 0) else 0
+            
+            fair_value = current_eps * calc_target_per
+            if fair_value > 0 and last_close > 0:
+                divergence = fair_value / last_close - 1
+            else:
+                divergence = None
+
+        # Uprev check
+        forward_eps = safe_float(info.get("forwardEps"))
+        trailing_eps = safe_float(info.get("trailingEps"))
+        if forward_eps is not None and trailing_eps is not None and trailing_eps > 0:
+            if forward_eps > trailing_eps * 1.10:
+                uprev = "あり"
+            else:
+                uprev = "なし"
+        
+    except Exception as e:
+        print(f"Error analyzing {t}: {e}")
+        pass
+
+    if trend_pass and rs_ok:
+        verdict = "合格"
+    elif trend_pass or rs_ok:
+        verdict = "監視"
+    else:
+        verdict = "除外"
+
+    allocation = "Half" if (alert or vol_high) else "Full"
+    target_sell = last_close * 1.14
+
+    return [
+        t.replace(".T", ""),
+        stock_name,
+        industry,
+        verdict,
+        round(last_close, 2),
+        round(fair_value, 2) if fair_value is not None else "",
+        divergence if divergence is not None else "",
+        round(buy_timing_price, 2) if buy_timing_price is not None else "",
+        round(target_sell, 2),
+        "○" if (last_close > float(ma75.iloc[-1]) and slope_positive(ma75, 20)) else "×",
+        f"{float(ma200.iloc[-1]):.0f} (上向き)" if slope_positive(ma200, 20) else f"{float(ma200.iloc[-1]):.0f} (横/下)",
+        round(rs_ratio, 3) if rs_ratio is not None else "",
+        format_bool_mark(vcp_hint),
+        op_cagr_val if op_cagr_val is not None else "",
+        ord_cagr_val if ord_cagr_val is not None else "",
+        eps_cagr_val if eps_cagr_val is not None else "",
+        uprev,
+        format_date(earnings_date),
+        alert,
+        format_bool_mark(vol_high),
+        allocation,
+    ]
+
 def analyze_universe(
     tickers: list[str],
     index_ticker: str,
-    target_per: float, # Note: This will be used as a base, but buhin.py logic adapts it
+    target_per: float,
 ) -> list[list]:
     if not tickers:
         return []
 
     all_symbols = tickers + [index_ticker]
 
-    # FIX: threads=False to avoid 'database is locked' errors when mixing download and Ticker
+    # threads=True に変更 (buhin.py参照)
     df = yf.download(
         tickers=all_symbols,
         period="2y",
         interval="1d",
         group_by="ticker",
         auto_adjust=False,
-        threads=False, 
+        threads=True, 
         progress=False,
     )
 
@@ -328,271 +594,21 @@ def analyze_universe(
         idx_close = data[index_ticker]["Close"].dropna()
 
     rows = []
-    for t in tickers:
-        print(f"Processing {t}...")
-        d = data.get(t)
-        if d is None or d.empty:
-            rows.append([t, "", "", "取得失敗"] + [""] * 19)
-            continue
-
-        close = d["Close"].dropna()
-        high = d["High"].dropna()
-
-        if len(close) < 260 or (not idx_close.empty and len(idx_close) < 260):
-            if len(close) < 260:
-                 rows.append([t, "", "", "データ不足"] + [""] * 19)
-            else:
-                 rows.append([t, "", "", "指数データ不足"] + [""] * 19)
-            continue
-
-        last_close = float(close.iloc[-1])
-
-        ma75 = close.rolling(75).mean()
-        ma150 = close.rolling(150).mean()
-        ma200 = close.rolling(200).mean()
-
-        trend_ok = (
-            (safe_float(ma75.iloc[-1]) is not None)
-            and (safe_float(ma150.iloc[-1]) is not None)
-            and (safe_float(ma200.iloc[-1]) is not None)
-            and (last_close > float(ma75.iloc[-1]) > float(ma150.iloc[-1]) > float(ma200.iloc[-1]))
-            and slope_positive(ma75, lookback=20)
-        )
-
-        close_252 = close.iloc[-252:]
-        low_52w = float(close_252.min())
-        high_52w = float(close_252.max())
-        hl_ok = (last_close > low_52w * 1.30) and (last_close > high_52w * 0.75)
-
-        trend_pass = trend_ok and hl_ok
-
-        t_now = float(close.iloc[-1])
-        t_1y = safe_float(close.shift(252).iloc[-1])
+    
+    # ThreadPoolExecutorによる並列処理に変更
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = []
+        for t in tickers:
+            print(f"Submitting {t}...")
+            d = data.get(t)
+            futures.append(executor.submit(process_single_ticker, t, d, idx_close))
         
-        rs_ratio = None
-        rs_ok = False
-
-        if not idx_close.empty:
-            i_now = float(idx_close.iloc[-1])
-            i_1y = safe_float(idx_close.shift(252).iloc[-1])
-            if t_1y and i_1y and t_1y > 0 and i_1y > 0:
-                rs_ratio = (t_now / t_1y) / (i_now / i_1y)
-                rs_ok = rs_ratio > 1.0
-
-        std10 = close.rolling(10).std()
-        vcp_hint = False
-        if std10.notna().sum() >= 70:
-            recent_std10 = safe_float(std10.iloc[-1])
-            mean_std10_60 = safe_float(std10.iloc[-60:].mean())
-            if recent_std10 is not None and mean_std10_60 is not None:
-                vcp_hint = recent_std10 < mean_std10_60
-
-        rets = close.pct_change()
-        vol20 = rets.rolling(20).std()
-        vol_high = False
-        if vol20.notna().sum() >= 90:
-            recent_vol20 = safe_float(vol20.iloc[-1])
-            mean_vol20_60 = safe_float(vol20.iloc[-60:].mean())
-            if recent_vol20 is not None and mean_vol20_60 is not None:
-                vol_high = recent_vol20 > mean_vol20_60
-
-        buy_timing_price = None
-        hi20 = safe_float(high.iloc[-20:].max()) if len(high) >= 20 else None
-        if hi20 is not None and last_close >= hi20 * 0.95:
-            buy_timing_price = hi20
-
-        # --- buhin.py logic integration starts here ---
-        
-        # Initialize placeholders
-        stock_name = ""
-        industry = "-"
-        fair_value = None
-        divergence = None
-        op_cagr_val = None
-        ord_cagr_val = None
-        eps_cagr_val = None
-        uprev = ""
-        earnings_date = None
-        alert = ""
-
-        try:
-            # 1. Scraping Name/Sector (buhin.py style)
-            stock_name, industry = get_japanese_name_and_sector(t)
-
-            tk = yf.Ticker(t)
-            
-            # 2. Calendar / Alert
+        for future in futures:
             try:
-                cal = tk.calendar
-                earnings_date = parse_earnings_date_from_calendar(cal)
-            except Exception:
-                earnings_date = None
-
-            if earnings_date is not None:
-                days = (earnings_date - get_today_jst()).days
-                if 0 <= days <= 30:
-                    alert = "⚠️1ヶ月以内"
-            
-            # 3. Financials (buhin.py robust logic)
-            financials = tk.financials
-            balance_sheet = tk.balance_sheet
-            info = tk.info or {}
-            
-            # Basic info extraction (fallback for name)
-            if stock_name == t or stock_name == "":
-                stock_name = info.get('longName', t)
-
-            # If no financials, skip calculation but keep row
-            if not financials.empty and not balance_sheet.empty:
-                latest_date_bs = balance_sheet.columns[0]
-                latest_date_pl = financials.columns[0]
-                
-                # --- ROIC Logic ---
-                op_income = get_value(financials, ['Operating Income', 'Operating Profit'], latest_date_pl)
-                nopat = op_income * 0.7
-                
-                interest_bearing_debt = get_value(balance_sheet, ['Total Debt'], latest_date_bs)
-                if interest_bearing_debt == 0:
-                    short_debt = get_value(balance_sheet, ['Current Debt', 'Short Long Term Debt'], latest_date_bs)
-                    long_debt = get_value(balance_sheet, ['Long Term Debt'], latest_date_bs)
-                    interest_bearing_debt = short_debt + long_debt
-                
-                equity = get_value(balance_sheet, ['Total Stockholder Equity', 'Total Equity', 'Stockholders Equity'], latest_date_bs)
-                forex_adj = get_value(balance_sheet, ['Foreign Currency Translation Adjustments', 'Accumulated Other Comprehensive Income'], latest_date_bs)
-                adjusted_equity = equity - forex_adj
-                if adjusted_equity <= 0: adjusted_equity = equity
-                
-                invested_capital = interest_bearing_debt + adjusted_equity
-                roic = (nopat / invested_capital * 100) if invested_capital > 0 else 0
-
-                # --- CAGR Logic ---
-                growth_dates = financials.columns[:4]
-                final_cagr = 0
-                
-                # Helper for EPS history for display
-                eps_row = pick_row(financials, ["Basic EPS", "Diluted EPS"])
-                eps_vals_display = annual_points_last_4(eps_row) if eps_row is not None else None
-                if eps_vals_display and len(eps_vals_display) >= 2:
-                    eps_cagr_val = compute_cagr_from_series(eps_vals_display)
-
-                # Helper for OP/Ord history for display
-                op_row_disp = pick_row(financials, ["Operating Income"])
-                op_vals_disp = annual_points_last_4(op_row_disp) if op_row_disp is not None else None
-                if op_vals_disp and len(op_vals_disp) >= 2:
-                    op_cagr_val = compute_cagr_from_series(op_vals_disp)
-
-                ord_row = pick_row(financials, ["Pretax Income", "Income Before Tax"])
-                ord_vals = annual_points_last_4(ord_row) if ord_row is not None else None
-                if ord_vals and len(ord_vals) >= 2:
-                    ord_cagr_val = compute_cagr_from_series(ord_vals)
-
-                # CAGR calculation for Valuation (buhin.py logic)
-                if len(growth_dates) >= 2:
-                    latest_d = growth_dates[0]
-                    oldest_d = growth_dates[-1]
-                    years_span = len(growth_dates) - 1
-                    
-                    def get_eps_val(d):
-                        val = get_value(financials, ['Basic EPS'], d)
-                        if val != 0: return val
-                        ni = get_value(financials, ['Net Income', 'Net Income Common Stockholders'], d)
-                        shares = get_value(financials, ['Basic Average Shares'], d)
-                        return ni / shares if (ni != 0 and shares > 0) else 0
-
-                    eps_latest = get_eps_val(latest_d)
-                    eps_oldest = get_eps_val(oldest_d)
-                    
-                    cagr_eps_internal = 0
-                    if eps_oldest > 0 and eps_latest > 0:
-                        cagr_eps_internal = ((eps_latest / eps_oldest)**(1 / years_span) - 1) * 100
-                    
-                    op_latest = get_value(financials, ['Operating Income'], latest_d)
-                    op_oldest = get_value(financials, ['Operating Income'], oldest_d)
-                    cagr_op_internal = 0
-                    if op_oldest > 0 and op_latest > 0:
-                        cagr_op_internal = ((op_latest / op_oldest)**(1 / years_span) - 1) * 100
-                    
-                    if cagr_eps_internal != 0 and cagr_op_internal != 0:
-                        final_cagr = min(cagr_eps_internal, cagr_op_internal)
-                    elif cagr_eps_internal != 0:
-                        final_cagr = cagr_eps_internal
-                    elif cagr_op_internal != 0:
-                        final_cagr = cagr_op_internal
-
-                # --- Target Price Logic ---
-                # Base PER selection
-                calc_target_per = 15
-                if final_cagr > 20: calc_target_per = 25
-                elif final_cagr > 10: calc_target_per = 20
-                elif final_cagr < 0: calc_target_per = 10
-                
-                # ROIC adjustment
-                if roic > 15: calc_target_per *= 1.15
-                elif roic >= 10: calc_target_per *= 1.05
-                elif roic < 5: calc_target_per *= 0.9
-                
-                # Cap
-                if calc_target_per > 25: calc_target_per = 25
-                
-                per_info = info.get('trailingPE', 0)
-                # Use current price from yf.download (last_close) for consistency
-                current_eps = last_close / per_info if (per_info and per_info > 0) else 0
-                
-                fair_value = current_eps * calc_target_per
-                if fair_value > 0 and last_close > 0:
-                    divergence = fair_value / last_close - 1
-                else:
-                    divergence = None
-
-            # Uprev check
-            forward_eps = safe_float(info.get("forwardEps"))
-            trailing_eps = safe_float(info.get("trailingEps"))
-            if forward_eps is not None and trailing_eps is not None and trailing_eps > 0:
-                if forward_eps > trailing_eps * 1.10:
-                    uprev = "あり"
-                else:
-                    uprev = "なし"
-            
-        except Exception as e:
-            print(f"Error analyzing {t}: {e}")
-            pass
-
-        if trend_pass and rs_ok:
-            verdict = "合格"
-        elif trend_pass or rs_ok:
-            verdict = "監視"
-        else:
-            verdict = "除外"
-
-        allocation = "Half" if (alert or vol_high) else "Full"
-
-        target_sell = last_close * 1.14
-
-        rows.append(
-            [
-                t.replace(".T", ""),
-                stock_name,
-                industry,
-                verdict,
-                round(last_close, 2),
-                round(fair_value, 2) if fair_value is not None else "",
-                divergence if divergence is not None else "",
-                round(buy_timing_price, 2) if buy_timing_price is not None else "",
-                round(target_sell, 2),
-                "○" if (last_close > float(ma75.iloc[-1]) and slope_positive(ma75, 20)) else "×",
-                f"{float(ma200.iloc[-1]):.0f} (上向き)" if slope_positive(ma200, 20) else f"{float(ma200.iloc[-1]):.0f} (横/下)",
-                round(rs_ratio, 3) if rs_ratio is not None else "",
-                format_bool_mark(vcp_hint),
-                op_cagr_val if op_cagr_val is not None else "",
-                ord_cagr_val if ord_cagr_val is not None else "",
-                eps_cagr_val if eps_cagr_val is not None else "",
-                uprev,
-                format_date(earnings_date),
-                alert,
-                format_bool_mark(vol_high),
-                allocation,
-            ]
-        )
+                res = future.result()
+                rows.append(res)
+            except Exception as e:
+                print(f"Processing Error: {e}")
 
     return rows
 
