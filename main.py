@@ -37,6 +37,20 @@ TSE_SECTORS = [
     "その他金融業", "不動産業", "サービス業"
 ]
 
+# 修正: User-Agentリスト (ランダム化用)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0"
+]
+
 def create_session():
     session = requests.Session()
     retry = Retry(
@@ -66,10 +80,13 @@ def get_japanese_name_and_sector(ticker_code):
     # .T を除去してURL作成
     code_only = ticker_code.replace(".T", "")
     url = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    # 修正: User-Agentランダム化
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
     
     try:
-        time.sleep(random.uniform(1.0, 2.0)) # Access block avoidance
+        # 修正: 待機時間短縮 (0.05-0.9s)
+        time.sleep(random.uniform(0.05, 0.9)) 
         
         res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
         res.encoding = res.apparent_encoding
@@ -92,7 +109,8 @@ def get_japanese_name_and_sector(ticker_code):
             
         return name, sector
     except Exception as e:
-        print(f"Scraping warning {ticker_code}: {e}")
+        # 修正: 銘柄コードをログに出さない
+        print(f"Scraping warning: {e}")
         return str(ticker_code), "-"
 
 
@@ -173,14 +191,13 @@ def read_tickers_from_sheet(ws) -> list[str]:
     return out
 
 
-def write_output(ws, headers: list[str], rows: list[list]):
-    # Write headers row 1 and data from row 2
-    ws.update(range_name="A1", values=[headers])
-    if rows:
-        ws.update(range_name="A2", values=rows)
-    else:
-        # Clear old data area minimally (leave headers)
-        ws.batch_clear(["A2:Z"])
+def write_output_batch(ws, rows: list[list], start_row: int):
+    """バッチ書き込み用ヘルパー"""
+    if not rows:
+        return
+    end_row = start_row + len(rows) - 1
+    range_name = f"A{start_row}:V{end_row}" # 21列分 (A-V)
+    ws.update(range_name=range_name, values=rows)
 
 
 # ----------------------------
@@ -294,19 +311,31 @@ def process_single_ticker(t, d, idx_close):
     """
     1銘柄分の分析を実行する関数（並列処理用）
     """
-    # 取得失敗チェック
+    # 取得失敗チェック (d is df from yf.download)
     if d is None or d.empty:
-        return [t, "", "", "取得失敗"] + [""] * 19
+        # yf.downloadで失敗していても、yf.Tickerで取れる可能性はあるが、
+        # ここでは株価必須として処理を進める（時短のため）
+        pass 
 
-    close = d["Close"].dropna()
-    high = d["High"].dropna()
+    # 株価データの準備 (download結果を使用)
+    close = pd.Series(dtype=float)
+    high = pd.Series(dtype=float)
+    if d is not None and not d.empty:
+        close = d["Close"].dropna()
+        high = d["High"].dropna()
 
     # データ不足チェック
-    if len(close) < 260 or (not idx_close.empty and len(idx_close) < 260):
-        if len(close) < 260:
-            return [t, "", "", "データ不足"] + [""] * 19
-        else:
-            return [t, "", "", "指数データ不足"] + [""] * 19
+    # 株価がない場合はスキップしたいが、財務データだけでも取る方針なら続行
+    # ここでは分析ロジック上、株価必須としてエラー扱いにする
+    if close.empty or len(close) < 1:
+         return [t, "", "", "取得失敗(株価なし)"] + [""] * 17
+
+    if len(close) < 260:
+         return [t, "", "", "データ不足"] + [""] * 17
+         
+    if not idx_close.empty and len(idx_close) < 260:
+         # 指数不足でも個別分析は続ける
+         pass
 
     last_close = float(close.iloc[-1])
 
@@ -379,10 +408,23 @@ def process_single_ticker(t, d, idx_close):
     alert = ""
 
     try:
-        # 1. Scraping Name/Sector (buhin.py style)
+        # 1. Scraping Name/Sector (optimized settings)
         stock_name, industry = get_japanese_name_and_sector(t)
 
         tk = yf.Ticker(t)
+        
+        # 修正: 404エラーの即時撤退チェック (Fail Fast)
+        # 基本情報(info)取得前に軽いチェックを入れたいが、yfinanceの構造上
+        # infoアクセス時に通信発生するため、try-exceptで囲む
+        try:
+             # info取得 (必須項目維持のため維持)
+             info = tk.info or {}
+        except Exception as e:
+             # 修正: エラーメッセージに銘柄コードを含めない
+             if "404" in str(e) or "Not Found" in str(e):
+                 return [t, "", "", "取得失敗(404)"] + [""] * 17
+             # その他のエラーは続行(空辞書)
+             info = {}
         
         # 2. Calendar / Alert
         try:
@@ -399,9 +441,8 @@ def process_single_ticker(t, d, idx_close):
         # 3. Financials (buhin.py robust logic)
         financials = tk.financials
         balance_sheet = tk.balance_sheet
-        info = tk.info or {}
         
-        # Basic info extraction (fallback for name)
+        # Basic info extraction (fallback for name - 修正: 英語名フォールバック維持)
         if stock_name == t or stock_name == "":
             stock_name = info.get('longName', t)
 
@@ -517,7 +558,8 @@ def process_single_ticker(t, d, idx_close):
                 uprev = "なし"
         
     except Exception as e:
-        print(f"Error analyzing {t}: {e}")
+        # 修正: エラーメッセージから銘柄コードの可能性を排除
+        print(f"Error analyzing (masked): {e}")
         pass
 
     if trend_pass and rs_ok:
@@ -554,64 +596,6 @@ def process_single_ticker(t, d, idx_close):
         allocation,
     ]
 
-def analyze_universe(
-    tickers: list[str],
-    index_ticker: str,
-    target_per: float,
-) -> list[list]:
-    if not tickers:
-        return []
-
-    all_symbols = tickers + [index_ticker]
-
-    # threads=True に変更 (buhin.py参照)
-    df = yf.download(
-        tickers=all_symbols,
-        period="2y",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True, 
-        progress=False,
-    )
-
-    data = {}
-    if isinstance(df.columns, pd.MultiIndex):
-        for sym in all_symbols:
-            if sym in df.columns.get_level_values(0):
-                sub = df[sym].dropna(how="all")
-                data[sym] = sub
-    else:
-        if len(all_symbols) == 1:
-             data[all_symbols[0]] = df.dropna(how="all")
-        else:
-             pass
-
-    if index_ticker not in data or data[index_ticker].empty:
-        print(f"Warning: Index ticker {index_ticker} data missing. RS calculation will fail.")
-        idx_close = pd.Series(dtype=float)
-    else:
-        idx_close = data[index_ticker]["Close"].dropna()
-
-    rows = []
-    
-    # ThreadPoolExecutorによる並列処理に変更
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        for t in tickers:
-            print(f"Submitting {t}...")
-            d = data.get(t)
-            futures.append(executor.submit(process_single_ticker, t, d, idx_close))
-        
-        for future in futures:
-            try:
-                res = future.result()
-                rows.append(res)
-            except Exception as e:
-                print(f"Processing Error: {e}")
-
-    return rows
-
 
 def main():
     cfg = load_app_config()
@@ -628,19 +612,107 @@ def main():
         return
 
     index_ticker = cfg.get("index_ticker", "^TOPX")
-    target_per = float(cfg.get("target_per", 15))
-
-    rows = analyze_universe(tickers, index_ticker=index_ticker, target_per=target_per)
-
+    
+    # --- バッチ処理への構造変更 ---
+    
+    # ヘッダー書き込み (初回のみ)
     headers = [
         "銘柄コード", "銘柄名", "業種", "判定結果", "現在値", "適正株価", "乖離率", "買いタイミング", "目標売値(利確)",
         "トレンド(75MA)", "トレンド(200MA)",
         "RS比(52週)", "VCP示唆", "営業利益3年増", "経常利益3年増", "EPS3年増",
         "上方修正期待", "決算発表日", "決算アラート", "Vol高", "推奨資金配分"
     ]
+    write_output_batch(ws, [headers], 1)
 
-    write_output(ws, headers, rows)
-    print(f"[OK] Updated rows: {len(rows)}")
+    # 全体のindexデータだけ先に取得しておく(効率化のため)
+    # ただしバッチ処理の趣旨からすると、ここも重いかもしれないが、
+    # Indexデータは1つなのでここで取ってしまう
+    idx_close = pd.Series(dtype=float)
+    try:
+        df_idx = yf.download(index_ticker, period="2y", interval="1d", auto_adjust=False, progress=False)
+        if not df_idx.empty:
+            if isinstance(df_idx.columns, pd.MultiIndex):
+                idx_close = df_idx["Close"][index_ticker].dropna() if index_ticker in df_idx.columns.get_level_values(0) else df_idx["Close"].iloc[:,0].dropna()
+            else:
+                idx_close = df_idx["Close"].dropna()
+    except Exception as e:
+        print(f"Index download error: {e}")
+
+    BATCH_SIZE = 50
+    total_tickers = len(tickers)
+    current_index = 0
+
+    print(f"Total Tickers: {total_tickers}")
+
+    while current_index < total_tickers:
+        end_index = min(current_index + BATCH_SIZE, total_tickers)
+        batch_tickers = tickers[current_index:end_index]
+        
+        # 修正: バッチ処理のログから具体的な銘柄リストを削除
+        print(f"Processing batch: {current_index + 1} - {end_index} / {total_tickers}")
+
+        # 1. バッチ分の株価一括取得 (yf.download維持)
+        batch_data = {}
+        try:
+            # columns mismatch回避のため group_by='ticker'
+            df_p = yf.download(
+                batch_tickers, 
+                period="2y", 
+                interval="1d", 
+                group_by='ticker', 
+                auto_adjust=False, 
+                threads=True, 
+                progress=False
+            )
+            
+            # DataFrame構造の正規化
+            if isinstance(df_p.columns, pd.MultiIndex):
+                for t in batch_tickers:
+                    if t in df_p.columns.get_level_values(0):
+                        batch_data[t] = df_p[t].dropna(how="all")
+            else:
+                # 1銘柄だけの場合
+                if len(batch_tickers) == 1:
+                    batch_data[batch_tickers[0]] = df_p.dropna(how="all")
+                else:
+                    # 稀なケース
+                    pass
+        except Exception as e:
+            # 修正: エラー内容のみ表示
+            print(f"Batch download error: {e}")
+
+        # 2. バッチ分の分析 (並列処理)
+        batch_rows = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for t in batch_tickers:
+                d = batch_data.get(t) # DataFrame or None
+                futures.append(executor.submit(process_single_ticker, t, d, idx_close))
+            
+            for future in futures:
+                try:
+                    res = future.result()
+                    batch_rows.append(res)
+                except Exception as e:
+                    print(f"Future result error: {e}")
+                    # エラー行も埋める
+                    batch_rows.append(["Error"] + ["Error"] * 20)
+
+        # 3. バッチ書き込み
+        # 開始行: ヘッダー(1) + 既処理数 + 1(1-based) => current_index + 2
+        start_write_row = current_index + 2
+        try:
+            write_output_batch(ws, batch_rows, start_write_row)
+            # API制限回避
+            time.sleep(2)
+        except Exception as e:
+            # 修正: バッチ番号のみ表示
+            print(f"Sheet write error at batch index {current_index}: {e}")
+
+        current_index += BATCH_SIZE
+        time.sleep(2) # バッチ間ウェイト
+
+    print("[OK] All batches processed.")
 
 
 if __name__ == "__main__":
