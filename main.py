@@ -177,9 +177,7 @@ def read_tickers_from_sheet(ws) -> list[str]:
         s = (s or "").strip()
         if not s:
             continue
-        # normalize: append .T if not already has suffix
-        if "." not in s:
-            s = f"{s}.T"
+        # 修正: スプレッドシートの値をそのまま使う（勝手に.Tをつけない）
         tickers.append(s)
     # de-dup while preserving order
     seen = set()
@@ -307,10 +305,18 @@ def parse_earnings_date_from_calendar(cal) -> date | None:
 # Core analysis (Parallelized)
 # ----------------------------
 
-def process_single_ticker(t, d, idx_close):
+def process_single_ticker(t_raw, d, idx_close):
     """
     1銘柄分の分析を実行する関数（並列処理用）
+    t_raw: スプレッドシート上の表記そのまま（例: "7203"）
+    d: 株価DataFrame
+    idx_close: 指数Closeデータ
     """
+    
+    # 修正: API用のティッカーシンボルを内部で生成 (例: "7203" -> "7203.T")
+    # スプシの値(t_raw)は変更せず、APIコール時のみ api_t を使う
+    api_t = f"{t_raw}.T" if str(t_raw).isdigit() else t_raw
+
     # 取得失敗チェック (d is df from yf.download)
     if d is None or d.empty:
         # yf.downloadで失敗していても、yf.Tickerで取れる可能性はあるが、
@@ -328,10 +334,10 @@ def process_single_ticker(t, d, idx_close):
     # 株価がない場合はスキップしたいが、財務データだけでも取る方針なら続行
     # ここでは分析ロジック上、株価必須としてエラー扱いにする
     if close.empty or len(close) < 1:
-         return [t, "", "", "取得失敗(株価なし)"] + [""] * 17
+         return [t_raw, "", "", "取得失敗(株価なし)"] + [""] * 17
 
     if len(close) < 260:
-         return [t, "", "", "データ不足"] + [""] * 17
+         return [t_raw, "", "", "データ不足"] + [""] * 17
          
     if not idx_close.empty and len(idx_close) < 260:
          # 指数不足でも個別分析は続ける
@@ -409,9 +415,10 @@ def process_single_ticker(t, d, idx_close):
 
     try:
         # 1. Scraping Name/Sector (optimized settings)
-        stock_name, industry = get_japanese_name_and_sector(t)
+        # Use api_t (e.g. "7203.T") for scraping
+        stock_name, industry = get_japanese_name_and_sector(api_t)
 
-        tk = yf.Ticker(t)
+        tk = yf.Ticker(api_t)
         
         # 修正: 404エラーの即時撤退チェック (Fail Fast)
         # 基本情報(info)取得前に軽いチェックを入れたいが、yfinanceの構造上
@@ -422,7 +429,7 @@ def process_single_ticker(t, d, idx_close):
         except Exception as e:
              # 修正: エラーメッセージに銘柄コードを含めない
              if "404" in str(e) or "Not Found" in str(e):
-                 return [t, "", "", "取得失敗(404)"] + [""] * 17
+                 return [t_raw, "", "", "取得失敗(404)"] + [""] * 17
              # その他のエラーは続行(空辞書)
              info = {}
         
@@ -443,8 +450,8 @@ def process_single_ticker(t, d, idx_close):
         balance_sheet = tk.balance_sheet
         
         # Basic info extraction (fallback for name - 修正: 英語名フォールバック維持)
-        if stock_name == t or stock_name == "":
-            stock_name = info.get('longName', t)
+        if stock_name == api_t or stock_name == "":
+            stock_name = info.get('longName', t_raw)
 
         # If no financials, skip calculation but keep row
         if not financials.empty and not balance_sheet.empty:
@@ -573,7 +580,7 @@ def process_single_ticker(t, d, idx_close):
     target_sell = last_close * 1.14
 
     return [
-        t.replace(".T", ""),
+        t_raw, # 修正: スプシから読み込んだ値をそのまま返す（.replace(".T", "")を削除）
         stock_name,
         industry,
         verdict,
@@ -625,8 +632,6 @@ def main():
     write_output_batch(ws, [headers], 1)
 
     # 全体のindexデータだけ先に取得しておく(効率化のため)
-    # ただしバッチ処理の趣旨からすると、ここも重いかもしれないが、
-    # Indexデータは1つなのでここで取ってしまう
     idx_close = pd.Series(dtype=float)
     try:
         df_idx = yf.download(index_ticker, period="2y", interval="1d", auto_adjust=False, progress=False)
@@ -646,17 +651,25 @@ def main():
 
     while current_index < total_tickers:
         end_index = min(current_index + BATCH_SIZE, total_tickers)
-        batch_tickers = tickers[current_index:end_index]
+        batch_tickers_raw = tickers[current_index:end_index] # スプシそのままのリスト
         
         # 修正: バッチ処理のログから具体的な銘柄リストを削除
         print(f"Processing batch: {current_index + 1} - {end_index} / {total_tickers}")
+
+        # 修正: yfinance用にAPI用リストを作成（数字のみなら.Tを付与）
+        # { "7203": "7203.T", "MSFT": "MSFT", "9984.T": "9984.T" } のようなマップを作る手もあるが
+        # yf.downloadはリストを受け取るため、API用リストを作成
+        def to_api_ticker(t):
+            return f"{t}.T" if str(t).isdigit() else t
+        
+        batch_tickers_api = [to_api_ticker(t) for t in batch_tickers_raw]
 
         # 1. バッチ分の株価一括取得 (yf.download維持)
         batch_data = {}
         try:
             # columns mismatch回避のため group_by='ticker'
             df_p = yf.download(
-                batch_tickers, 
+                batch_tickers_api, 
                 period="2y", 
                 interval="1d", 
                 group_by='ticker', 
@@ -666,16 +679,16 @@ def main():
             )
             
             # DataFrame構造の正規化
+            # API用ティッカーをキーとしてデータを格納
             if isinstance(df_p.columns, pd.MultiIndex):
-                for t in batch_tickers:
-                    if t in df_p.columns.get_level_values(0):
-                        batch_data[t] = df_p[t].dropna(how="all")
+                for t_api in batch_tickers_api:
+                    if t_api in df_p.columns.get_level_values(0):
+                        batch_data[t_api] = df_p[t_api].dropna(how="all")
             else:
                 # 1銘柄だけの場合
-                if len(batch_tickers) == 1:
-                    batch_data[batch_tickers[0]] = df_p.dropna(how="all")
+                if len(batch_tickers_api) == 1:
+                    batch_data[batch_tickers_api[0]] = df_p.dropna(how="all")
                 else:
-                    # 稀なケース
                     pass
         except Exception as e:
             # 修正: エラー内容のみ表示
@@ -685,9 +698,12 @@ def main():
         batch_rows = []
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
-            for t in batch_tickers:
-                d = batch_data.get(t) # DataFrame or None
-                futures.append(executor.submit(process_single_ticker, t, d, idx_close))
+            for t_raw in batch_tickers_raw:
+                # 取得時はAPI用ティッカーを使う
+                t_api = to_api_ticker(t_raw)
+                d = batch_data.get(t_api) # DataFrame or None
+                # 関数には「元の表記」を渡す（書き込み用）
+                futures.append(executor.submit(process_single_ticker, t_raw, d, idx_close))
             
             for future in futures:
                 try:
