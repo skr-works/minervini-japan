@@ -2,7 +2,7 @@ name: sepa-jp-daily
 
 on:
   schedule:
-    - cron: "34 7 * * 1-5"  # JST 16:34 (UTC 06:34)
+    - cron: "34 7 * * 1-5"  # JST 16:34 (UTC 07:34)
   workflow_dispatch:
 
 permissions:
