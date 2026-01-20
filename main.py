@@ -313,6 +313,9 @@ def process_single_ticker(t_raw, d, idx_close):
     idx_close: 指数Closeデータ
     """
     
+    # === 追加修正: 個別処理ごとの待機時間 ===
+    time.sleep(random.uniform(0.5, 1.5))
+    
     # 修正: API用のティッカーシンボルを内部で生成 (例: "7203" -> "7203.T")
     # スプシの値(t_raw)は変更せず、APIコール時のみ api_t を使う
     api_t = f"{t_raw}.T" if str(t_raw).isdigit() else t_raw
@@ -420,25 +423,34 @@ def process_single_ticker(t_raw, d, idx_close):
 
         tk = yf.Ticker(api_t)
         
-        # 修正: 404エラーの即時撤退チェック (Fail Fast)
-        # 基本情報(info)取得前に軽いチェックを入れたいが、yfinanceの構造上
-        # infoアクセス時に通信発生するため、try-exceptで囲む
-        try:
-             # info取得 (必須項目維持のため維持)
-             info = tk.info or {}
-        except Exception as e:
-             # 修正: エラーメッセージに銘柄コードを含めない
-             if "404" in str(e) or "Not Found" in str(e):
-                 return [t_raw, "", "", "取得失敗(404)"] + [""] * 17
-             # その他のエラーは続行(空辞書)
-             info = {}
+        # === 追加修正: info取得にリトライロジックを追加 ===
+        info = {}
+        # Max retries = 3
+        for i_retry in range(3):
+            try:
+                temp_info = tk.info or {}
+                if temp_info:
+                    info = temp_info
+                    break
+            except Exception as e:
+                # 404の場合は即時撤退（リトライしても無駄なため）
+                if "404" in str(e) or "Not Found" in str(e):
+                    return [t_raw, "", "", "取得失敗(404)"] + [""] * 17
+                # それ以外は少し待ってリトライ
+                time.sleep(1.0 + i_retry)
         
         # 2. Calendar / Alert
-        try:
-            cal = tk.calendar
-            earnings_date = parse_earnings_date_from_calendar(cal)
-        except Exception:
-            earnings_date = None
+        # === 追加修正: Calendar取得にリトライロジックを追加 ===
+        cal = None
+        for i_retry in range(3):
+            try:
+                cal = tk.calendar
+                if cal is not None:
+                    break
+            except Exception:
+                time.sleep(1.0 + i_retry)
+
+        earnings_date = parse_earnings_date_from_calendar(cal)
 
         if earnings_date is not None:
             days = (earnings_date - get_today_jst()).days
@@ -446,8 +458,24 @@ def process_single_ticker(t_raw, d, idx_close):
                 alert = "⚠️1ヶ月以内"
         
         # 3. Financials (buhin.py robust logic)
-        financials = tk.financials
-        balance_sheet = tk.balance_sheet
+        # === 追加修正: Financials/BalanceSheet取得にリトライロジックを追加 ===
+        financials = pd.DataFrame()
+        for i_retry in range(3):
+            try:
+                financials = tk.financials
+                if not financials.empty:
+                    break
+            except Exception:
+                time.sleep(1.0 + i_retry)
+
+        balance_sheet = pd.DataFrame()
+        for i_retry in range(3):
+            try:
+                balance_sheet = tk.balance_sheet
+                if not balance_sheet.empty:
+                    break
+            except Exception:
+                time.sleep(1.0 + i_retry)
         
         # Basic info extraction (fallback for name - 修正: 英語名フォールバック維持)
         if stock_name == api_t or stock_name == "":
