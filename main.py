@@ -85,8 +85,8 @@ def get_japanese_name_and_sector(ticker_code):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     
     try:
-        # 修正: 待機時間短縮 (0.05-0.9s)
-        time.sleep(random.uniform(0.05, 0.9)) 
+        # 修正: 待機時間を延長 (max_workers=4対策)
+        time.sleep(random.uniform(2.0, 4.0)) 
         
         res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
         res.encoding = res.apparent_encoding
@@ -167,18 +167,30 @@ def open_worksheet(cfg: dict):
 
 
 def read_tickers_from_sheet(ws) -> list[str]:
-    # A2 downwards, allow blanks
-    col = ws.col_values(1)  # A column
-    if len(col) <= 1:
+    # 修正: A列(コード)とB列(名称/ステータス)をまとめて取得
+    raw_rows = ws.get("A2:B")
+    
+    if not raw_rows:
         return []
-    raw = col[1:]  # from A2
+
     tickers = []
-    for s in raw:
-        s = (s or "").strip()
-        if not s:
+    for row in raw_rows:
+        # row[0] = Code, row[1] = Name/Status (存在する場合)
+        if not row:
             continue
-        # 修正: スプレッドシートの値をそのまま使う（勝手に.Tをつけない）
-        tickers.append(s)
+            
+        code = (row[0] or "").strip()
+        status = (row[1] or "").strip() if len(row) > 1 else ""
+
+        if not code:
+            continue
+        
+        # 修正: B列に "DELISTED" や "廃止" が含まれていたらスキップ
+        if "DELISTED" in status or "廃止" in status:
+            continue
+            
+        tickers.append(code)
+
     # de-dup while preserving order
     seen = set()
     out = []
@@ -313,8 +325,8 @@ def process_single_ticker(t_raw, d, idx_close):
     idx_close: 指数Closeデータ
     """
     
-    # === 追加修正: 個別処理ごとの待機時間 ===
-    time.sleep(random.uniform(0.5, 1.5))
+    # === 修正: 待機時間を延長 (max_workers=4対策) ===
+    time.sleep(random.uniform(3.0, 5.0))
     
     # 修正: API用のティッカーシンボルを内部で生成 (例: "7203" -> "7203.T")
     # スプシの値(t_raw)は変更せず、APIコール時のみ api_t を使う
@@ -334,13 +346,13 @@ def process_single_ticker(t_raw, d, idx_close):
         high = d["High"].dropna()
 
     # データ不足チェック
-    # 株価がない場合はスキップしたいが、財務データだけでも取る方針なら続行
-    # ここでは分析ロジック上、株価必須としてエラー扱いにする
+    # 修正: 取得失敗時はB列に"DELISTED"を入れて次回スキップ
     if close.empty or len(close) < 1:
-         return [t_raw, "", "", "取得失敗(株価なし)"] + [""] * 17
+         return [t_raw, "DELISTED", "-", "取得失敗(株価なし)"] + [""] * 17
 
     if len(close) < 260:
-         return [t_raw, "", "", "データ不足"] + [""] * 17
+         # データ不足(上場直後など)
+         return [t_raw, "データ不足", "-", "データ不足"] + [""] * 17
          
     if not idx_close.empty and len(idx_close) < 260:
          # 指数不足でも個別分析は続ける
@@ -748,13 +760,15 @@ def main():
         try:
             write_output_batch(ws, batch_rows, start_write_row)
             # API制限回避
-            time.sleep(2)
+            # 修正: バッチ間待機時間を延長
+            time.sleep(15)
         except Exception as e:
             # 修正: バッチ番号のみ表示
             print(f"Sheet write error at batch index {current_index}: {e}")
 
         current_index += BATCH_SIZE
-        time.sleep(2) # バッチ間ウェイト
+        # 修正: バッチ間待機時間を延長 (再掲: バックアップとしてループ末尾にも)
+        time.sleep(15) 
 
     print("[OK] All batches processed.")
 
