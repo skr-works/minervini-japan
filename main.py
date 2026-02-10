@@ -166,47 +166,53 @@ def open_worksheet(cfg: dict):
     return ws
 
 
-def read_tickers_from_sheet(ws) -> list[str]:
-    # 修正: A列(コード)とB列(名称/ステータス)をまとめて取得
-    raw_rows = ws.get("A2:B")
+def read_tickers_from_sheet(ws) -> list:
+    """
+    修正: A列(コード), B列(銘柄名), C列(業種) を取得する。
+    戻り値は [ [code, name, sector], ... ] のリスト
+    """
+    raw_rows = ws.get("A2:C")
     
     if not raw_rows:
         return []
 
-    tickers = []
+    data_list = []
+    seen = set()
+
     for row in raw_rows:
-        # row[0] = Code, row[1] = Name/Status (存在する場合)
+        # row[0]=Code, row[1]=Name, row[2]=Sector (存在する場合)
         if not row:
             continue
             
         code = (row[0] or "").strip()
-        status = (row[1] or "").strip() if len(row) > 1 else ""
+        
+        # 安全に名前と業種を取得
+        name = (row[1] or "").strip() if len(row) > 1 else ""
+        sector = (row[2] or "").strip() if len(row) > 2 else ""
 
         if not code:
             continue
         
-        # 修正: B列に "DELISTED" や "廃止" が含まれていたらスキップ
-        if "DELISTED" in status or "廃止" in status:
+        # 修正: 名称に "DELISTED" や "廃止" が含まれていたらスキップ
+        if "DELISTED" in name or "廃止" in name:
             continue
             
-        tickers.append(code)
+        if code not in seen:
+            seen.add(code)
+            data_list.append([code, name, sector])
 
-    # de-dup while preserving order
-    seen = set()
-    out = []
-    for t in tickers:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    return data_list
 
 
 def write_output_batch(ws, rows: list[list], start_row: int):
-    """バッチ書き込み用ヘルパー"""
+    """
+    修正: D列以降への書き込みに変更
+    """
     if not rows:
         return
     end_row = start_row + len(rows) - 1
-    range_name = f"A{start_row}:V{end_row}" # 21列分 (A-V)
+    # D列(4番目)からV列(22番目)まで = 19列分
+    range_name = f"D{start_row}:V{end_row}" 
     ws.update(range_name=range_name, values=rows)
 
 
@@ -317,25 +323,25 @@ def parse_earnings_date_from_calendar(cal) -> date | None:
 # Core analysis (Parallelized)
 # ----------------------------
 
-def process_single_ticker(t_raw, d, idx_close):
+def process_single_ticker(ticker_data_tuple, d, idx_close):
     """
     1銘柄分の分析を実行する関数（並列処理用）
-    t_raw: スプレッドシート上の表記そのまま（例: "7203"）
+    ticker_data_tuple: (t_raw, pre_name, pre_sector) のタプル
     d: 株価DataFrame
     idx_close: 指数Closeデータ
+    
+    修正: D列以降のデータリストのみを返すように変更
     """
+    t_raw, pre_name, pre_sector = ticker_data_tuple
     
     # === 修正: 待機時間を延長 (max_workers=4対策) ===
     time.sleep(random.uniform(3.0, 5.0))
     
-    # 修正: API用のティッカーシンボルを内部で生成 (例: "7203" -> "7203.T")
-    # スプシの値(t_raw)は変更せず、APIコール時のみ api_t を使う
+    # API用のティッカーシンボルを内部で生成 (例: "7203" -> "7203.T")
     api_t = f"{t_raw}.T" if str(t_raw).isdigit() else t_raw
 
     # 取得失敗チェック (d is df from yf.download)
     if d is None or d.empty:
-        # yf.downloadで失敗していても、yf.Tickerで取れる可能性はあるが、
-        # ここでは株価必須として処理を進める（時短のため）
         pass 
 
     # 株価データの準備 (download結果を使用)
@@ -346,13 +352,14 @@ def process_single_ticker(t_raw, d, idx_close):
         high = d["High"].dropna()
 
     # データ不足チェック
-    # 修正: 取得失敗時はB列に"DELISTED"を入れて次回スキップ
+    # 修正: A-C列は出力しないため、D列(判定結果)以降のみを返す
     if close.empty or len(close) < 1:
-         return [t_raw, "DELISTED", "-", "取得失敗(株価なし)"] + [""] * 17
+         # [判定, 現在値, ...] -> 19要素
+         return ["取得失敗(株価なし)"] + [""] * 18
 
     if len(close) < 260:
          # データ不足(上場直後など)
-         return [t_raw, "データ不足", "-", "データ不足"] + [""] * 17
+         return ["データ不足"] + [""] * 18
          
     if not idx_close.empty and len(idx_close) < 260:
          # 指数不足でも個別分析は続ける
@@ -431,7 +438,11 @@ def process_single_ticker(t_raw, d, idx_close):
     try:
         # 1. Scraping Name/Sector (optimized settings)
         # Use api_t (e.g. "7203.T") for scraping
-        stock_name, industry = get_japanese_name_and_sector(api_t)
+        
+        # === 修正: 今回はスプシの値を使い、スクレイピングはコメントアウトして保存 ===
+        # stock_name, industry = get_japanese_name_and_sector(api_t)
+        stock_name = pre_name
+        industry = pre_sector
 
         tk = yf.Ticker(api_t)
         
@@ -447,7 +458,8 @@ def process_single_ticker(t_raw, d, idx_close):
             except Exception as e:
                 # 404の場合は即時撤退（リトライしても無駄なため）
                 if "404" in str(e) or "Not Found" in str(e):
-                    return [t_raw, "", "", "取得失敗(404)"] + [""] * 17
+                    # D列以降のみを返す
+                    return ["取得失敗(404)"] + [""] * 18
                 # それ以外は少し待ってリトライ
                 time.sleep(1.0 + i_retry)
         
@@ -619,10 +631,8 @@ def process_single_ticker(t_raw, d, idx_close):
     allocation = "Half" if (alert or vol_high) else "Full"
     target_sell = last_close * 1.14
 
+    # 修正: D列以降の19要素のみを返す (Code, Name, Industryは除外)
     return [
-        t_raw, # 修正: スプシから読み込んだ値をそのまま返す（.replace(".T", "")を削除）
-        stock_name,
-        industry,
         verdict,
         round(last_close, 2),
         round(fair_value, 2) if fair_value is not None else "",
@@ -653,8 +663,9 @@ def main():
         return
 
     ws = open_worksheet(cfg)
-    tickers = read_tickers_from_sheet(ws)
-    if not tickers:
+    # 修正: A-C列を読み込む変数に変更
+    tickers_data = read_tickers_from_sheet(ws)
+    if not tickers_data:
         print("No tickers in sheet.")
         return
 
@@ -663,12 +674,14 @@ def main():
     # --- バッチ処理への構造変更 ---
     
     # ヘッダー書き込み (初回のみ)
-    headers = [
+    full_headers = [
         "銘柄コード", "銘柄名", "業種", "判定結果", "現在値", "適正株価", "乖離率", "買いタイミング", "目標売値(利確)",
         "トレンド(75MA)", "トレンド(200MA)",
         "RS比(52週)", "VCP示唆", "営業利益3年増", "経常利益3年増", "EPS3年増",
         "上方修正期待", "決算発表日", "決算アラート", "Vol高", "推奨資金配分"
     ]
+    # 修正: D列以降のヘッダーのみを書き込む (スライスで判定結果以降を抽出)
+    headers = full_headers[3:]
     write_output_batch(ws, [headers], 1)
 
     # 全体のindexデータだけ先に取得しておく(効率化のため)
@@ -684,25 +697,23 @@ def main():
         print(f"Index download error: {e}")
 
     BATCH_SIZE = 50
-    total_tickers = len(tickers)
+    total_tickers = len(tickers_data)
     current_index = 0
 
     print(f"Total Tickers: {total_tickers}")
 
     while current_index < total_tickers:
         end_index = min(current_index + BATCH_SIZE, total_tickers)
-        batch_tickers_raw = tickers[current_index:end_index] # スプシそのままのリスト
+        batch_tickers_tuples = tickers_data[current_index:end_index] 
         
         # 修正: バッチ処理のログから具体的な銘柄リストを削除
         print(f"Processing batch: {current_index + 1} - {end_index} / {total_tickers}")
 
-        # 修正: yfinance用にAPI用リストを作成（数字のみなら.Tを付与）
-        # { "7203": "7203.T", "MSFT": "MSFT", "9984.T": "9984.T" } のようなマップを作る手もあるが
-        # yf.downloadはリストを受け取るため、API用リストを作成
+        # 修正: API用リストを作成 (タプルの0番目=コード を使用)
         def to_api_ticker(t):
             return f"{t}.T" if str(t).isdigit() else t
         
-        batch_tickers_api = [to_api_ticker(t) for t in batch_tickers_raw]
+        batch_tickers_api = [to_api_ticker(t[0]) for t in batch_tickers_tuples]
 
         # 1. バッチ分の株価一括取得 (yf.download維持)
         batch_data = {}
@@ -738,12 +749,13 @@ def main():
         batch_rows = []
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
-            for t_raw in batch_tickers_raw:
+            for t_tuple in batch_tickers_tuples:
                 # 取得時はAPI用ティッカーを使う
+                t_raw = t_tuple[0]
                 t_api = to_api_ticker(t_raw)
                 d = batch_data.get(t_api) # DataFrame or None
-                # 関数には「元の表記」を渡す（書き込み用）
-                futures.append(executor.submit(process_single_ticker, t_raw, d, idx_close))
+                # 関数には「タプル全体」を渡す
+                futures.append(executor.submit(process_single_ticker, t_tuple, d, idx_close))
             
             for future in futures:
                 try:
@@ -751,8 +763,8 @@ def main():
                     batch_rows.append(res)
                 except Exception as e:
                     print(f"Future result error: {e}")
-                    # エラー行も埋める
-                    batch_rows.append(["Error"] + ["Error"] * 20)
+                    # エラー行も埋める(19要素)
+                    batch_rows.append(["Error"] + ["Error"] * 18)
 
         # 3. バッチ書き込み
         # 開始行: ヘッダー(1) + 既処理数 + 1(1-based) => current_index + 2
