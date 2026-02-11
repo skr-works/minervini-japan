@@ -24,6 +24,14 @@ import jpholiday
 JST = ZoneInfo("Asia/Tokyo")
 
 # ==========================================
+# ★ 設定: B/C列のスクレイピング・入力切替
+# True : スクレイピングを行い、B列(銘柄名)・C列(業種)からV列までを更新 (低速)
+# False: スクレイピングを行わず、D列(判定結果)からV列までを更新 (高速)
+# ==========================================
+UPDATE_BC_WITH_SCRAPING = True
+
+
+# ==========================================
 # 1. スクレイピング & 設定ロジック (from buhin.py)
 # ==========================================
 
@@ -206,13 +214,19 @@ def read_tickers_from_sheet(ws) -> list:
 
 def write_output_batch(ws, rows: list[list], start_row: int):
     """
-    修正: D列以降への書き込みに変更
+    修正: 設定に応じて書き込み範囲を変更
+    UPDATE_BC_WITH_SCRAPING is True  => B列(2番目)〜V列(22番目) = 21列分
+    UPDATE_BC_WITH_SCRAPING is False => D列(4番目)〜V列(22番目) = 19列分
     """
     if not rows:
         return
     end_row = start_row + len(rows) - 1
-    # D列(4番目)からV列(22番目)まで = 19列分
-    range_name = f"D{start_row}:V{end_row}" 
+    
+    if UPDATE_BC_WITH_SCRAPING:
+        range_name = f"B{start_row}:V{end_row}"
+    else:
+        range_name = f"D{start_row}:V{end_row}"
+        
     ws.update(range_name=range_name, values=rows)
 
 
@@ -330,7 +344,9 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
     d: 株価DataFrame
     idx_close: 指数Closeデータ
     
-    修正: D列以降のデータリストのみを返すように変更
+    修正: 設定(UPDATE_BC_WITH_SCRAPING)に応じて戻り値を変更
+    True  -> [Name, Sector, 判定, ... (計21要素)]
+    False -> [判定, ... (計19要素)]
     """
     t_raw, pre_name, pre_sector = ticker_data_tuple
     
@@ -339,6 +355,16 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
     
     # API用のティッカーシンボルを内部で生成 (例: "7203" -> "7203.T")
     api_t = f"{t_raw}.T" if str(t_raw).isdigit() else t_raw
+
+    # 結果作成ヘルパー: エラー時などの戻り値生成
+    def make_result_row(msg_list, is_error=True):
+        # msg_list: [Verdict, LastPrice...] 形式のリスト (19要素)
+        # 設定がTrueの場合、先頭にName, Sectorを追加して返す
+        if UPDATE_BC_WITH_SCRAPING:
+            # エラー時等は元の名前・業種を維持して返す
+            return [pre_name, pre_sector] + msg_list
+        else:
+            return msg_list
 
     # 取得失敗チェック (d is df from yf.download)
     if d is None or d.empty:
@@ -352,14 +378,12 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
         high = d["High"].dropna()
 
     # データ不足チェック
-    # 修正: A-C列は出力しないため、D列(判定結果)以降のみを返す
     if close.empty or len(close) < 1:
-         # [判定, 現在値, ...] -> 19要素
-         return ["取得失敗(株価なし)"] + [""] * 18
+         return make_result_row(["取得失敗(株価なし)"] + [""] * 18)
 
     if len(close) < 260:
          # データ不足(上場直後など)
-         return ["データ不足"] + [""] * 18
+         return make_result_row(["データ不足"] + [""] * 18)
          
     if not idx_close.empty and len(idx_close) < 260:
          # 指数不足でも個別分析は続ける
@@ -437,12 +461,12 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
 
     try:
         # 1. Scraping Name/Sector (optimized settings)
-        # Use api_t (e.g. "7203.T") for scraping
-        
-        # === 修正: 今回はスプシの値を使い、スクレイピングはコメントアウトして保存 ===
-        # stock_name, industry = get_japanese_name_and_sector(api_t)
-        stock_name = pre_name
-        industry = pre_sector
+        # 修正: 設定に応じてスクレイピング実行有無を分岐
+        if UPDATE_BC_WITH_SCRAPING:
+            stock_name, industry = get_japanese_name_and_sector(api_t)
+        else:
+            stock_name = pre_name
+            industry = pre_sector
 
         tk = yf.Ticker(api_t)
         
@@ -458,8 +482,7 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
             except Exception as e:
                 # 404の場合は即時撤退（リトライしても無駄なため）
                 if "404" in str(e) or "Not Found" in str(e):
-                    # D列以降のみを返す
-                    return ["取得失敗(404)"] + [""] * 18
+                    return make_result_row(["取得失敗(404)"] + [""] * 18)
                 # それ以外は少し待ってリトライ
                 time.sleep(1.0 + i_retry)
         
@@ -631,8 +654,8 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
     allocation = "Half" if (alert or vol_high) else "Full"
     target_sell = last_close * 1.14
 
-    # 修正: D列以降の19要素のみを返す (Code, Name, Industryは除外)
-    return [
+    # 19要素の分析結果リスト
+    analysis_row = [
         verdict,
         round(last_close, 2),
         round(fair_value, 2) if fair_value is not None else "",
@@ -652,6 +675,12 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
         format_bool_mark(vol_high),
         allocation,
     ]
+
+    # 修正: 設定に応じて結合して返す
+    if UPDATE_BC_WITH_SCRAPING:
+        return [stock_name, industry] + analysis_row
+    else:
+        return analysis_row
 
 
 def main():
@@ -680,8 +709,15 @@ def main():
         "RS比(52週)", "VCP示唆", "営業利益3年増", "経常利益3年増", "EPS3年増",
         "上方修正期待", "決算発表日", "決算アラート", "Vol高", "推奨資金配分"
     ]
-    # 修正: D列以降のヘッダーのみを書き込む (スライスで判定結果以降を抽出)
-    headers = full_headers[3:]
+    
+    # 修正: 設定に応じて書き込むヘッダーを調整
+    if UPDATE_BC_WITH_SCRAPING:
+        # B列(銘柄名)から書き込む
+        headers = full_headers[1:]
+    else:
+        # D列(判定結果)から書き込む
+        headers = full_headers[3:]
+        
     write_output_batch(ws, [headers], 1)
 
     # 全体のindexデータだけ先に取得しておく(効率化のため)
@@ -763,8 +799,13 @@ def main():
                     batch_rows.append(res)
                 except Exception as e:
                     print(f"Future result error: {e}")
-                    # エラー行も埋める(19要素)
-                    batch_rows.append(["Error"] + ["Error"] * 18)
+                    # エラー行も埋める
+                    err_padding = ["Error"] * 18
+                    # 設定に合わせて列数を調整
+                    if UPDATE_BC_WITH_SCRAPING:
+                        batch_rows.append(["Error", "Error", "Error"] + err_padding)
+                    else:
+                        batch_rows.append(["Error"] + err_padding)
 
         # 3. バッチ書き込み
         # 開始行: ヘッダー(1) + 既処理数 + 1(1-based) => current_index + 2
