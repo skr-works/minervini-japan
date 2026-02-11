@@ -6,4 +6,4 @@ gspread==6.1.4
 google-auth==2.33.0
 
 jpholiday==0.1.10
-requests==2.32.3
+requests==2.32.4
