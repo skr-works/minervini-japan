@@ -28,7 +28,7 @@ JST = ZoneInfo("Asia/Tokyo")
 # True : スクレイピングを行い、B列(銘柄名)・C列(業種)からV列までを更新 (低速)
 # False: スクレイピングを行わず、D列(判定結果)からV列までを更新 (高速)
 # ==========================================
-UPDATE_BC_WITH_SCRAPING = True
+UPDATE_BC_WITH_SCRAPING = False
 
 
 # ==========================================
