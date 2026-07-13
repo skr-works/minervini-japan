@@ -335,7 +335,8 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
     """
     t_raw, pre_name, pre_sector = ticker_data_tuple
 
-    time.sleep(random.uniform(3.0, 5.0))
+    if UPDATE_BC_WITH_SCRAPING:
+        time.sleep(random.uniform(3.0, 5.0))
 
     api_t = f"{t_raw}.T" if str(t_raw).isdigit() else t_raw
 
@@ -567,12 +568,12 @@ def main():
         start_write_row = current_index + 2
         try:
             write_output_batch(ws, batch_rows, start_write_row)
-            time.sleep(15)
         except Exception as e:
             print(f"Sheet write error at batch index {current_index}: {e}")
 
         current_index += BATCH_SIZE
-        time.sleep(15)
+        if current_index < total_tickers:
+            time.sleep(15)
 
     print("[OK] All batches processed.")
 
