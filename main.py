@@ -30,6 +30,27 @@ JST = ZoneInfo("Asia/Tokyo")
 # ==========================================
 UPDATE_BC_WITH_SCRAPING = False
 
+BREAKOUT_LOOKBACK = 20
+BREAKOUT_MAX_EXTENSION = 0.05
+
+RS_LOOKBACKS = {
+    63: 0.40,
+    126: 0.20,
+    189: 0.20,
+    252: 0.20,
+}
+RS_PERCENTILE_THRESHOLD = 70.0
+MIN_RS_UNIVERSE_SIZE = 20
+
+VOLUME_LOOKBACK = 50
+BREAKOUT_VOLUME_RATIO = 1.5
+VOLUME_DRY_LOOKBACK = 10
+VOLUME_DRY_RATIO = 0.80
+
+ATR_PERIOD = 10
+ATR_BASELINE_LOOKBACK = 60
+ATR_CONTRACTION_RATIO = 0.80
+
 
 # ==========================================
 # 1. スクレイピング & 設定ロジック (from buhin.py)
@@ -216,6 +237,23 @@ def write_output_batch(ws, rows: list[list], start_row: int):
     ws.update(range_name=range_name, values=rows)
 
 
+def write_output_headers(ws):
+    ws.update(
+        range_name="D1:L1",
+        values=[[
+            "判定",
+            "終値",
+            "ピボット価格",
+            "50日線判定",
+            "200日線判定",
+            "RS順位(%)",
+            "VCP",
+            "出来高倍率",
+            "ATR収縮",
+        ]],
+    )
+
+
 # ----------------------------
 # Finance helpers
 # ----------------------------
@@ -323,15 +361,24 @@ def parse_earnings_date_from_calendar(cal) -> date | None:
 # Core analysis (Parallelized)
 # ----------------------------
 
+def get_series_value_on_or_before(series: pd.Series, target_date) -> float | None:
+    if series is None or series.empty:
+        return None
+    try:
+        eligible = series.loc[:target_date].dropna()
+        if eligible.empty:
+            return None
+        return safe_float(eligible.iloc[-1])
+    except Exception:
+        return None
+
+
 def process_single_ticker(ticker_data_tuple, d, idx_close):
     """
-    1銘柄分の分析を実行する関数（並列処理用）
+    1銘柄分の基礎指標を計算する関数（並列処理用）
     ticker_data_tuple: (t_raw, pre_name, pre_sector) のタプル
     d: 株価DataFrame
     idx_close: 指数Closeデータ
-
-    UPDATE_BC_WITH_SCRAPING=True  -> [Name, Sector, 判定, ...] (計11要素)
-    UPDATE_BC_WITH_SCRAPING=False -> [判定, ...] (計9要素)
     """
     t_raw, pre_name, pre_sector = ticker_data_tuple
 
@@ -343,11 +390,7 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
     def make_result_row(msg_list):
         if UPDATE_BC_WITH_SCRAPING:
             return [pre_name, pre_sector] + msg_list
-        else:
-            return msg_list
-
-    if d is None or d.empty:
-        pass
+        return msg_list
 
     close = pd.Series(dtype=float)
     high = pd.Series(dtype=float)
@@ -361,13 +404,10 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
         volume = d["Volume"].dropna()
 
     if close.empty or len(close) < 1:
-        return make_result_row(["取得失敗(株価なし)"] + [""] * 8)
+        return {"final_row": make_result_row(["取得失敗(株価なし)"] + [""] * 8)}
 
     if len(close) < 260:
-        return make_result_row(["データ不足"] + [""] * 8)
-
-    if not idx_close.empty and len(idx_close) < 260:
-        pass
+        return {"final_row": make_result_row(["データ不足"] + [""] * 8)}
 
     last_close = float(close.iloc[-1])
 
@@ -399,51 +439,107 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
 
     trend_pass = trend_ok and hl_ok
 
-    t_now = float(close.iloc[-1])
-    t_1y = safe_float(close.shift(252).iloc[-1])
+    rs_score = None
+    rs_12m = None
+    if not idx_close.empty and len(idx_close) > max(RS_LOOKBACKS):
+        base_date = idx_close.index[-1]
+        index_now = safe_float(idx_close.iloc[-1])
+        ticker_now = get_series_value_on_or_before(close, base_date)
+        rs_values = {}
 
-    rs_ratio = None
-    rs_ok = False
+        if index_now is not None and ticker_now is not None and index_now > 0 and ticker_now > 0:
+            for lookback, weight in RS_LOOKBACKS.items():
+                target_date = idx_close.index[-(lookback + 1)]
+                index_past = safe_float(idx_close.iloc[-(lookback + 1)])
+                ticker_past = get_series_value_on_or_before(close, target_date)
 
-    if not idx_close.empty:
-        i_now = float(idx_close.iloc[-1])
-        i_1y = safe_float(idx_close.shift(252).iloc[-1])
-        if t_1y and i_1y and t_1y > 0 and i_1y > 0:
-            rs_ratio = (t_now / t_1y) / (i_now / i_1y)
-            rs_ok = rs_ratio > 1.0
+                if (
+                    index_past is not None
+                    and ticker_past is not None
+                    and index_past > 0
+                    and ticker_past > 0
+                ):
+                    rs_values[lookback] = (
+                        (ticker_now / ticker_past) / (index_now / index_past)
+                    ) - 1
 
-    std10 = close.rolling(10).std()
-    vcp_hint = False
-    if std10.notna().sum() >= 70:
-        recent_std10 = safe_float(std10.iloc[-1])
-        mean_std10_60 = safe_float(std10.iloc[-60:].mean())
-        if recent_std10 is not None and mean_std10_60 is not None:
-            vcp_hint = recent_std10 < mean_std10_60
-
-    rets = close.pct_change()
-    vol20 = rets.rolling(20).std()
-    vol_high = False
-    if vol20.notna().sum() >= 90:
-        recent_vol20 = safe_float(vol20.iloc[-1])
-        mean_vol20_60 = safe_float(vol20.iloc[-60:].mean())
-        if recent_vol20 is not None and mean_vol20_60 is not None:
-            vol_high = recent_vol20 > mean_vol20_60
+            rs_12m = rs_values.get(252)
+            if len(rs_values) == len(RS_LOOKBACKS):
+                rs_score = sum(
+                    rs_values[lookback] * weight
+                    for lookback, weight in RS_LOOKBACKS.items()
+                )
 
     pivot_price = None
-    breakout_ok = False
-    if len(high) >= 21:
-        pivot_price = safe_float(high.shift(1).rolling(20).max().iloc[-1])
-        if pivot_price is not None:
-            breakout_ok = last_close > pivot_price
+    breakout_today = False
+    if len(high) >= BREAKOUT_LOOKBACK + 1 and len(close) >= 2:
+        pivot_price = safe_float(
+            high.shift(1).rolling(BREAKOUT_LOOKBACK).max().iloc[-1]
+        )
+        previous_close = safe_float(close.iloc[-2])
+        if pivot_price is not None and pivot_price > 0 and previous_close is not None:
+            breakout_extension = (last_close / pivot_price) - 1
+            breakout_today = (
+                previous_close <= pivot_price
+                and last_close > pivot_price
+                and breakout_extension <= BREAKOUT_MAX_EXTENSION
+            )
 
     volume_ratio = None
     volume_ok = False
-    if volume.notna().sum() >= 50:
-        avg_volume_50 = safe_float(volume.rolling(50).mean().iloc[-1])
+    volume_dry_ok = False
+    if volume.notna().sum() >= VOLUME_LOOKBACK + 1:
+        avg_volume_50 = safe_float(
+            volume.shift(1).rolling(VOLUME_LOOKBACK).mean().iloc[-1]
+        )
         latest_volume = safe_float(volume.iloc[-1])
-        if avg_volume_50 is not None and latest_volume is not None and avg_volume_50 > 0:
-            volume_ratio = latest_volume / avg_volume_50
-            volume_ok = volume_ratio >= 1.5
+        pre_breakout_volume_10 = safe_float(
+            volume.shift(1).rolling(VOLUME_DRY_LOOKBACK).mean().iloc[-1]
+        )
+
+        if avg_volume_50 is not None and avg_volume_50 > 0:
+            if latest_volume is not None:
+                volume_ratio = latest_volume / avg_volume_50
+                volume_ok = volume_ratio >= BREAKOUT_VOLUME_RATIO
+
+            if pre_breakout_volume_10 is not None:
+                volume_dry_ok = (
+                    pre_breakout_volume_10
+                    <= avg_volume_50 * VOLUME_DRY_RATIO
+                )
+
+    atr_contraction_ok = False
+    if not high.empty and not low.empty:
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low - close.shift(1)).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr10 = true_range.rolling(ATR_PERIOD).mean()
+        normalized_atr10 = atr10 / close
+
+        latest_normalized_atr = safe_float(normalized_atr10.iloc[-1])
+        atr_baseline = safe_float(
+            normalized_atr10.shift(1)
+            .rolling(ATR_BASELINE_LOOKBACK)
+            .mean()
+            .iloc[-1]
+        )
+
+        if (
+            latest_normalized_atr is not None
+            and atr_baseline is not None
+            and atr_baseline > 0
+        ):
+            atr_contraction_ok = (
+                latest_normalized_atr
+                <= atr_baseline * ATR_CONTRACTION_RATIO
+            )
+
+    vcp_ok = volume_dry_ok and atr_contraction_ok
 
     stock_name = pre_name
     industry = pre_sector
@@ -453,30 +549,114 @@ def process_single_ticker(ticker_data_tuple, d, idx_close):
     except Exception as e:
         print(f"Error analyzing (masked): {e}")
 
-    if trend_pass and rs_ok and breakout_ok and volume_ok:
-        verdict = "合格"
-    elif trend_pass and rs_ok:
-        verdict = "監視"
-    else:
-        verdict = "除外"
+    return {
+        "final_row": None,
+        "stock_name": stock_name,
+        "industry": industry,
+        "trend_pass": trend_pass,
+        "breakout_today": breakout_today,
+        "last_close": last_close,
+        "pivot_price": pivot_price,
+        "ma50_mark": "○" if (
+            ma50_last is not None
+            and last_close > ma50_last
+            and slope_positive(ma50, 20)
+        ) else "×",
+        "ma200_text": (
+            f"{ma200_last:.0f} (上向き)"
+            if ma200_last is not None and slope_positive(ma200, 20)
+            else (
+                f"{ma200_last:.0f} (横/下)"
+                if ma200_last is not None
+                else ""
+            )
+        ),
+        "rs_score": rs_score,
+        "rs_12m": rs_12m,
+        "rs_percentile": None,
+        "volume_ratio": volume_ratio,
+        "volume_ok": volume_ok,
+        "vcp_ok": vcp_ok,
+        "atr_contraction_ok": atr_contraction_ok,
+    }
 
-    analysis_row = [
-        verdict,
-        round(last_close, 2),
-        round(pivot_price, 2) if pivot_price is not None else "",
-        "○" if (ma50_last is not None and last_close > ma50_last and slope_positive(ma50, 20)) else "×",
-        f"{ma200_last:.0f} (上向き)" if (ma200_last is not None and slope_positive(ma200, 20)) else (f"{ma200_last:.0f} (横/下)" if ma200_last is not None else ""),
-        round(rs_ratio, 3) if rs_ratio is not None else "",
-        format_bool_mark(vcp_hint),
-        round(volume_ratio, 2) if volume_ratio is not None else "",
-        format_bool_mark(vol_high),
+
+def finalize_results(results: list[dict]) -> list[list]:
+    valid_indexes = [
+        i
+        for i, result in enumerate(results)
+        if result.get("final_row") is None
+        and result.get("rs_score") is not None
     ]
 
-    if UPDATE_BC_WITH_SCRAPING:
-        return [stock_name, industry] + analysis_row
-    else:
-        return analysis_row
+    if valid_indexes:
+        rs_series = pd.Series(
+            [results[i]["rs_score"] for i in valid_indexes],
+            index=valid_indexes,
+            dtype=float,
+        )
+        rs_percentiles = rs_series.rank(method="average", pct=True) * 100
+        for i in valid_indexes:
+            results[i]["rs_percentile"] = safe_float(rs_percentiles.loc[i])
 
+    use_percentile_ranking = len(valid_indexes) >= MIN_RS_UNIVERSE_SIZE
+    output_rows = []
+
+    for result in results:
+        if result.get("final_row") is not None:
+            output_rows.append(result["final_row"])
+            continue
+
+        if use_percentile_ranking:
+            rs_ok = (
+                result["rs_percentile"] is not None
+                and result["rs_percentile"] >= RS_PERCENTILE_THRESHOLD
+            )
+        else:
+            rs_ok = (
+                result["rs_12m"] is not None
+                and result["rs_12m"] > 0
+            )
+
+        if (
+            result["trend_pass"]
+            and rs_ok
+            and result["breakout_today"]
+            and result["volume_ok"]
+            and result["vcp_ok"]
+        ):
+            verdict = "合格"
+        elif result["trend_pass"] and rs_ok:
+            verdict = "監視"
+        else:
+            verdict = "除外"
+
+        analysis_row = [
+            verdict,
+            round(result["last_close"], 2),
+            round(result["pivot_price"], 2)
+            if result["pivot_price"] is not None
+            else "",
+            result["ma50_mark"],
+            result["ma200_text"],
+            round(result["rs_percentile"], 1)
+            if result["rs_percentile"] is not None
+            else "",
+            format_bool_mark(result["vcp_ok"]),
+            round(result["volume_ratio"], 2)
+            if result["volume_ratio"] is not None
+            else "",
+            format_bool_mark(result["atr_contraction_ok"]),
+        ]
+
+        if UPDATE_BC_WITH_SCRAPING:
+            output_rows.append(
+                [result["stock_name"], result["industry"]] + analysis_row
+            )
+        else:
+            output_rows.append(analysis_row)
+
+    return output_rows
 
 def main():
     cfg = load_app_config()
@@ -508,6 +688,7 @@ def main():
     BATCH_SIZE = 50
     total_tickers = len(tickers_data)
     current_index = 0
+    all_results = []
 
     print(f"Total Tickers: {total_tickers}")
 
@@ -544,7 +725,6 @@ def main():
         except Exception as e:
             print(f"Batch download error: {e}")
 
-        batch_rows = []
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
             for t_tuple in batch_tickers_tuples:
@@ -555,14 +735,33 @@ def main():
 
             for future in futures:
                 try:
-                    res = future.result()
-                    batch_rows.append(res)
+                    all_results.append(future.result())
                 except Exception as e:
                     print(f"Future result error: {e}")
                     if UPDATE_BC_WITH_SCRAPING:
-                        batch_rows.append(["Error", "Error", "Error"] + [""] * 8)
+                        all_results.append({
+                            "final_row": ["Error", "Error", "Error"] + [""] * 8
+                        })
                     else:
-                        batch_rows.append(["Error"] + [""] * 8)
+                        all_results.append({
+                            "final_row": ["Error"] + [""] * 8
+                        })
+
+        current_index += BATCH_SIZE
+        if current_index < total_tickers:
+            time.sleep(15)
+
+    output_rows = finalize_results(all_results)
+
+    try:
+        write_output_headers(ws)
+    except Exception as e:
+        print(f"Sheet header write error: {e}")
+
+    current_index = 0
+    while current_index < total_tickers:
+        end_index = min(current_index + BATCH_SIZE, total_tickers)
+        batch_rows = output_rows[current_index:end_index]
 
         # 1行目は固定ヘッダー用。データは2行目から出力する。
         start_write_row = current_index + 2
@@ -572,8 +771,6 @@ def main():
             print(f"Sheet write error at batch index {current_index}: {e}")
 
         current_index += BATCH_SIZE
-        if current_index < total_tickers:
-            time.sleep(15)
 
     print("[OK] All batches processed.")
 
